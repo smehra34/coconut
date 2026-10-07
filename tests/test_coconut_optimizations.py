@@ -24,10 +24,21 @@ class ToyDecoder(nn.Module):
         super().__init__()
         self.proj = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, inputs_embeds, **kwargs):
+    def forward(
+        self, inputs_embeds, past_key_values=None, use_cache=False, **kwargs
+    ):
         # Causal mixing makes later latent replacements depend on earlier ones.
-        hidden = torch.tanh(self.proj(inputs_embeds.cumsum(dim=1)))
-        return SimpleNamespace(last_hidden_state=hidden, past_key_values=None)
+        if past_key_values is not None:
+            all_inputs = torch.cat((past_key_values, inputs_embeds), dim=1)
+        else:
+            all_inputs = inputs_embeds
+        hidden = torch.tanh(self.proj(all_inputs.cumsum(dim=1)))
+        if past_key_values is not None:
+            hidden = hidden[:, -inputs_embeds.shape[1] :]
+        return SimpleNamespace(
+            last_hidden_state=hidden,
+            past_key_values=all_inputs if use_cache else None,
+        )
 
 
 class ToyCausalLM(nn.Module):
@@ -51,6 +62,23 @@ class ToyCausalLM(nn.Module):
                 return parent.lm_head(hidden_states)
 
         return CountedProjection()
+
+    def forward(
+        self,
+        inputs_embeds,
+        past_key_values=None,
+        use_cache=False,
+        **kwargs,
+    ):
+        outputs = self.model(
+            inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+        return SimpleNamespace(
+            logits=self.lm_head(outputs.last_hidden_state),
+            past_key_values=outputs.past_key_values,
+        )
 
 
 class ReferenceCoconut(Coconut):
@@ -174,6 +202,51 @@ class CoconutOptimizationTest(unittest.TestCase):
                 full_parameter.grad,
                 msg=lambda message: f"gradient mismatch for {full_name}: {message}",
             )
+
+    def test_generation_cache_matches_full_prefix_generation(self):
+        torch.manual_seed(19)
+        model = Coconut(ToyCausalLM(), 10, 11, 12, 1).eval()
+        input_ids = torch.tensor([[2, 3, 10, 10, 4]])
+        attention_mask = torch.ones_like(input_ids)
+
+        without_cache = model.generate(
+            input_ids,
+            attention_mask,
+            max_new_tokens=8,
+            use_generation_cache=False,
+        )
+        with_cache = model.generate(
+            input_ids,
+            attention_mask,
+            max_new_tokens=8,
+            use_generation_cache=True,
+        )
+        torch.testing.assert_close(with_cache, without_cache)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused AdamW requires CUDA")
+    def test_fused_adamw_matches_unfused_update(self):
+        torch.manual_seed(23)
+        unfused_parameter = nn.Parameter(torch.randn(31, device="cuda"))
+        fused_parameter = nn.Parameter(unfused_parameter.detach().clone())
+        unfused = torch.optim.AdamW(
+            [unfused_parameter], lr=2e-5, weight_decay=0.01, fused=False
+        )
+        fused = torch.optim.AdamW(
+            [fused_parameter], lr=2e-5, weight_decay=0.01, fused=True
+        )
+
+        for _ in range(4):
+            gradient = torch.randn_like(unfused_parameter)
+            unfused_parameter.grad = gradient.clone()
+            fused_parameter.grad = gradient.clone()
+            unfused.step()
+            fused.step()
+            unfused.zero_grad()
+            fused.zero_grad()
+
+        torch.testing.assert_close(
+            fused_parameter, unfused_parameter, rtol=1e-6, atol=1e-7
+        )
 
 
 if __name__ == "__main__":

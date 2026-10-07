@@ -770,7 +770,10 @@ def main():
                 ):
                     if configs.coconut:
                         batch_loss = parallel_model(
-                            **batch, output_full_logits=False
+                            **batch,
+                            output_full_logits=not config_value(
+                                configs, "selective_loss_logits", False
+                            ),
                         ).loss
                     else:
                         batch_loss = forward_for_loss(
@@ -801,6 +804,16 @@ def main():
                 )
                 if profiler is not None:
                     profiler.step()
+                    if step + 1 >= config_value(
+                        configs, "profile_training_steps", 1
+                    ):
+                        profiler.stop()
+                        print(
+                            profiler.key_averages().table(
+                                sort_by="self_cuda_time_total", row_limit=30
+                            )
+                        )
+                        profiler = None
             pbar.close()
             if profiler is not None:
                 profiler.stop()
@@ -874,7 +887,10 @@ def main():
                     ):
                         if configs.coconut:
                             loss = parallel_model(
-                                **batch, output_full_logits=False
+                                **batch,
+                                output_full_logits=not config_value(
+                                    configs, "selective_loss_logits", False
+                                ),
                             ).loss
                         else:
                             loss = forward_for_loss(

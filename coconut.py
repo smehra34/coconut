@@ -45,13 +45,12 @@ class Coconut(nn.Module):
         compute_logits=True,
         use_cache=False,
     ):
-        """Return final-step logits and hidden states without using a KV cache.
+        """Return final-step logits, hidden states, and an optional KV cache.
 
         Decoder-style Hugging Face models expose a base model's final hidden
         state directly. Ouro instead returns its recurrent-step hidden states
-        as an additional tuple, so it needs a small adapter. Keeping this path
-        cache-free is slower, but it is robust across cache implementations and
-        retains the full autograd graph required by Coconut training.
+        as an additional tuple, so it needs a small adapter. Training leaves
+        caching disabled to retain the complete autograd graph.
         """
         if self.is_ouro:
             decoder_outputs, recurrent_hidden_states, _ = self.base_causallm.model(
@@ -256,7 +255,6 @@ class Coconut(nn.Module):
                     ),
                     "past_key_values": past_key_values,
                     "use_cache": True,
-                    "logits_to_keep": 1,
                 }
                 if self.is_ouro:
                     model_kwargs["exit_at_step"] = (

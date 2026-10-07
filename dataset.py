@@ -55,7 +55,7 @@ def _stage_cache_path(cache_dir, namespace, base_dataset, identity):
     return os.path.join(cache_dir, f"{namespace}-{digest}")
 
 
-def _save_dataset_atomically(dataset, cache_path):
+def _build_and_save_dataset_atomically(build_dataset, cache_path):
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     lock_path = f"{cache_path}.lock"
     with open(lock_path, "w") as lock_file:
@@ -67,6 +67,7 @@ def _save_dataset_atomically(dataset, cache_path):
         )
         os.rmdir(temporary_path)
         try:
+            dataset = build_dataset()
             dataset.save_to_disk(temporary_path)
             os.replace(temporary_path, cache_path)
         finally:
@@ -81,7 +82,7 @@ def _load_or_build_dataset(cache_path, build_dataset):
     if not os.path.isdir(cache_path) and (
         not distributed or dist.get_rank() == 0
     ):
-        _save_dataset_atomically(build_dataset(), cache_path)
+        _build_and_save_dataset_atomically(build_dataset, cache_path)
     if distributed:
         dist.barrier()
     return load_from_disk(cache_path)
@@ -456,7 +457,7 @@ def get_cot_latent_dataset(
             dataset = dataset.shuffle()
         return dataset
 
-    if torch.cuda.device_count() > 1:
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
         if dist.get_rank() == 0:
             processed_dataset = build_dataset()
             if shuffle:

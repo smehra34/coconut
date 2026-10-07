@@ -153,8 +153,10 @@ checkpoint and its Coconut branch.
 
 The training implementation intentionally disables KV caching inside Coconut.
 It recomputes each current prefix, which is slower but preserves gradients and
-works uniformly with Qwen's and Ouro's different cache types. Inference has not
-been optimized by this fork.
+works uniformly with Qwen's and Ouro's different cache types. Validation
+generation can independently enable inference-only KV caching with
+`validation_kv_cache: true`; this does not alter the differentiable training
+path.
 
 Intermediate latent passes skip the unused vocabulary projection, and latent
 feedback uses a vectorized indexed update. Base examples are tokenized in
@@ -164,6 +166,31 @@ shuffle behavior. FSDP remains the default distributed strategy. On the CSCS
 GH200 benchmark, optional DDP used more memory and was slower for Qwen, while
 its small Ouro gain did not justify using different strategies across the
 comparison.
+
+Additional efficiency controls are deliberately opt-in:
+
+- `fused_optimizer: true` selects PyTorch's fused AdamW implementation.
+- `selective_loss_logits: true` projects only loss-bearing positions through
+  the vocabulary head. It is numerically equivalent, but the measured stage-3
+  batches were slower (Qwen: 18.37 vs 21.16 examples/s; Ouro: 20.81 vs 21.41)
+  while saving 4.66 and 1.35 GiB/GPU respectively, so full logits remain the
+  default.
+- `stage_cache_dir` controls deterministic curriculum-stage datasets and
+  defaults to `data/stage_cache`. Stochastic `uniform_prob` datasets bypass
+  this cache.
+- `profile_training: true` prints a rank-0 CPU/CUDA operator profile for one
+  batch by default; adjust it with `profile_training_steps`.
+- `validation_kv_cache: true` enables KV reuse only for Coconut validation
+  generation.
+
+Run the real-model equivalence smoke test and the controlled optimizer/
+attention matrix with:
+
+```bash
+mkdir -p logs/slurm
+sbatch slurm/test_safe_optimizations.slurm
+sbatch slurm/benchmark_safe_optimizations.slurm
+```
 
 ### CSCS Alps launch
 
