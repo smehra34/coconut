@@ -4,4 +4,5 @@ checkpoints/
 data/gsm_*.json
 data/tokenized_cache/
 data/tokenized_cache_test/
+data/stage_cache/
 logs/

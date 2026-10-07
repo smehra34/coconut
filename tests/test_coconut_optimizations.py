@@ -27,7 +27,7 @@ class ToyDecoder(nn.Module):
     def forward(self, inputs_embeds, **kwargs):
         # Causal mixing makes later latent replacements depend on earlier ones.
         hidden = torch.tanh(self.proj(inputs_embeds.cumsum(dim=1)))
-        return SimpleNamespace(last_hidden_state=hidden)
+        return SimpleNamespace(last_hidden_state=hidden, past_key_values=None)
 
 
 class ToyCausalLM(nn.Module):
@@ -72,7 +72,7 @@ class ReferenceCoconut(Coconut):
                 if len(indices) > pass_idx
             ]
             prefix_end = max(active_positions)
-            _, hidden_states = self._forward_chunk(
+            _, hidden_states, _ = self._forward_chunk(
                 inputs_embeds[:, :prefix_end],
                 attention_mask[:, :prefix_end],
                 position_ids[:, :prefix_end],
@@ -91,7 +91,7 @@ class ReferenceCoconut(Coconut):
                 [torch.stack(instance) for instance in tensor_list]
             )
 
-        logits, _ = self._forward_chunk(
+        logits, _, _ = self._forward_chunk(
             inputs_embeds, attention_mask, position_ids
         )
         shift_logits = logits[..., :-1, :].contiguous()
@@ -137,6 +137,42 @@ class CoconutOptimizationTest(unittest.TestCase):
                 actual_parameter.grad,
                 expected_parameter.grad,
                 msg=lambda message: f"gradient mismatch for {actual_name}: {message}",
+            )
+
+    def test_selective_logits_match_full_loss_and_gradients(self):
+        torch.manual_seed(11)
+        full = Coconut(ToyCausalLM(), 10, 11, 12, 1)
+        selective = copy.deepcopy(full)
+        input_ids = torch.tensor(
+            [[2, 3, 10, 10, 4, 5, 1], [6, 7, 8, 10, 9, 4, 1]]
+        )
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(input_ids.shape[1]).expand_as(input_ids)
+        labels = input_ids.clone()
+        labels[:, :4] = -100
+
+        full_output = full(input_ids, attention_mask, labels, position_ids)
+        selective_output = selective(
+            input_ids,
+            attention_mask,
+            labels,
+            position_ids,
+            output_full_logits=False,
+        )
+        self.assertIsNone(selective_output.logits)
+        torch.testing.assert_close(selective_output.loss, full_output.loss)
+
+        full_output.loss.backward()
+        selective_output.loss.backward()
+        for (full_name, full_parameter), (
+            selective_name,
+            selective_parameter,
+        ) in zip(full.named_parameters(), selective.named_parameters()):
+            self.assertEqual(full_name, selective_name)
+            torch.testing.assert_close(
+                selective_parameter.grad,
+                full_parameter.grad,
+                msg=lambda message: f"gradient mismatch for {full_name}: {message}",
             )
 
 

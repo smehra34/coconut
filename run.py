@@ -97,6 +97,16 @@ def causal_lm_loss(logits, labels):
     )
 
 
+def create_optimizer(parameters, configs):
+    kwargs = {
+        "lr": configs.lr,
+        "weight_decay": configs.weight_decay,
+    }
+    if config_value(configs, "fused_optimizer", False):
+        kwargs["fused"] = True
+    return optim.AdamW(parameters, **kwargs)
+
+
 def forward_for_loss(parallel_model, batch, is_ouro, ouro_recurrent_steps):
     """Use final recurrent-step logits for direct Ouro baselines.
 
@@ -576,11 +586,7 @@ def main():
         optimizer = None
 
     else:
-        optimizer = optim.AdamW(
-            parallel_model.parameters(),
-            lr=configs.lr,
-            weight_decay=configs.weight_decay,
-        )
+        optimizer = create_optimizer(parallel_model.parameters(), configs)
 
     best_acc = resume_state.get("best_acc", 0) if resume_state else 0
 
@@ -630,6 +636,7 @@ def main():
             latent_id,
             end_id,
             no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+            cache_dir=config_value(configs, "stage_cache_dir", "data/stage_cache"),
         )
 
         valid_gen_dataloader = torch.utils.data.DataLoader(
@@ -652,6 +659,7 @@ def main():
                 end_id,
                 no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
                 shuffle=True,
+                cache_dir=config_value(configs, "stage_cache_dir", "data/stage_cache"),
             )
 
             train_dataloader = torch.utils.data.DataLoader(
@@ -676,6 +684,7 @@ def main():
                 latent_id,
                 end_id,
                 no_special_marker=configs.cot or configs.no_cot or configs.no_thoughts,
+                cache_dir=config_value(configs, "stage_cache_dir", "data/stage_cache"),
             )
 
             valid_loss_dataloader = torch.utils.data.DataLoader(
@@ -691,11 +700,7 @@ def main():
             if configs.reset_optimizer:
                 del optimizer
 
-                optimizer = optim.AdamW(
-                    parallel_model.parameters(),
-                    lr=configs.lr,
-                    weight_decay=configs.weight_decay,
-                )
+                optimizer = create_optimizer(parallel_model.parameters(), configs)
 
             parallel_model.module.train()
 
@@ -703,6 +708,18 @@ def main():
             torch.cuda.reset_peak_memory_stats(local_rank)
             train_start_time = time.monotonic()
             local_examples_seen = 0
+            profiler = None
+            if rank == 0 and config_value(configs, "profile_training", False):
+                profiler = torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=False,
+                )
+                profiler.start()
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -752,7 +769,9 @@ def main():
                     enabled=configs.bf16 and distributed_strategy == "ddp",
                 ):
                     if configs.coconut:
-                        batch_loss = parallel_model(**batch).loss
+                        batch_loss = parallel_model(
+                            **batch, output_full_logits=False
+                        ).loss
                     else:
                         batch_loss = forward_for_loss(
                             parallel_model, batch, is_ouro, ouro_recurrent_steps
@@ -780,7 +799,16 @@ def main():
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
                     f"completed (loss: {round(float(loss.detach().float() * configs.gradient_accumulation_steps), 4)}"
                 )
+                if profiler is not None:
+                    profiler.step()
             pbar.close()
+            if profiler is not None:
+                profiler.stop()
+                print(
+                    profiler.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=30
+                    )
+                )
             torch.cuda.synchronize(local_rank)
             train_elapsed = torch.tensor(
                 time.monotonic() - train_start_time,
@@ -845,7 +873,9 @@ def main():
                         enabled=configs.bf16 and distributed_strategy == "ddp",
                     ):
                         if configs.coconut:
-                            loss = parallel_model(**batch).loss
+                            loss = parallel_model(
+                                **batch, output_full_logits=False
+                            ).loss
                         else:
                             loss = forward_for_loss(
                                 parallel_model, batch, is_ouro, ouro_recurrent_steps
@@ -875,6 +905,8 @@ def main():
 
         with torch.no_grad():
             parallel_model.module.eval()
+            torch.cuda.synchronize(local_rank)
+            generation_start_time = time.monotonic()
             for idx, batch in enumerate(valid_gen_dataloader):
                 test_idx = batch["idx"][0]
 
@@ -898,6 +930,10 @@ def main():
                     "max_new_tokens": max_new_tokens,
                     "synced_gpus": distributed_strategy == "fsdp",
                 }
+                if configs.coconut:
+                    generation_kwargs["use_generation_cache"] = config_value(
+                        configs, "validation_kv_cache", False
+                    )
                 if distributed_strategy == "ddp":
                     outputs = parallel_model.module.generate(**generation_kwargs)
                 else:
@@ -933,6 +969,13 @@ def main():
                 )
 
             pbar.close()
+            torch.cuda.synchronize(local_rank)
+            generation_elapsed = torch.tensor(
+                time.monotonic() - generation_start_time,
+                dtype=torch.float64,
+                device=local_rank,
+            )
+            dist.all_reduce(generation_elapsed, op=dist.ReduceOp.MAX)
             print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
 
         dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
@@ -943,6 +986,11 @@ def main():
         cor = cor.item()
         total = total.item()
         if rank == 0:
+            print(
+                "Generation throughput: "
+                f"{total / generation_elapsed.item():.2f} examples/s "
+                f"({total} examples in {generation_elapsed.item():.2f}s)"
+            )
             print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
             print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
         sys.stdout.flush()

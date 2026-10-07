@@ -6,7 +6,9 @@ import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from collections import namedtuple
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+Outputs = namedtuple(
+    "Outputs", ["loss", "inputs_embeds", "logits", "past_key_values"], defaults=[None]
+)
 MAX_N_LATENT = 8
 
 
@@ -36,7 +38,12 @@ class Coconut(nn.Module):
         return getattr(self.base_causallm.config, "model_type", None) == "ouro"
 
     def _forward_chunk(
-        self, inputs_embeds, attention_mask, position_ids, compute_logits=True
+        self,
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        compute_logits=True,
+        use_cache=False,
     ):
         """Return final-step logits and hidden states without using a KV cache.
 
@@ -47,11 +54,11 @@ class Coconut(nn.Module):
         retains the full autograd graph required by Coconut training.
         """
         if self.is_ouro:
-            _, recurrent_hidden_states, _ = self.base_causallm.model(
+            decoder_outputs, recurrent_hidden_states, _ = self.base_causallm.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=False,
+                use_cache=use_cache,
             )
             if not recurrent_hidden_states:
                 raise RuntimeError("Ouro did not return recurrent hidden states")
@@ -61,7 +68,7 @@ class Coconut(nn.Module):
                 if compute_logits
                 else None
             )
-            return logits, hidden_states
+            return logits, hidden_states, decoder_outputs.past_key_values
 
         decoder = getattr(self.base_causallm, "model", None)
         if decoder is not None:
@@ -69,7 +76,7 @@ class Coconut(nn.Module):
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=False,
+                use_cache=use_cache,
                 return_dict=True,
             )
             hidden_states = outputs.last_hidden_state
@@ -78,22 +85,31 @@ class Coconut(nn.Module):
                 if compute_logits
                 else None
             )
-            return logits, hidden_states
+            return logits, hidden_states, outputs.past_key_values
 
         outputs = self.base_causallm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_hidden_states=True,
-            use_cache=False,
+            use_cache=use_cache,
         )
         if outputs.hidden_states is None:
             raise RuntimeError(
                 f"{type(self.base_causallm).__name__} did not return hidden states"
             )
-        return outputs.logits, outputs.hidden_states[-1]
+        return outputs.logits, outputs.hidden_states[-1], outputs.past_key_values
 
-    def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        labels,
+        position_ids,
+        output_full_logits=True,
+        use_cache=False,
+        **kwargs,
+    ):
 
         latent_indices = (
             input_ids == self.latent_token_id
@@ -115,7 +131,7 @@ class Coconut(nn.Module):
                 if len(latent_list) > pass_idx
             ]
             prefix_end = max(active_latent_positions)
-            _, hidden_states = self._forward_chunk(
+            _, hidden_states, _ = self._forward_chunk(
                 inputs_embeds=inputs_embeds[:, :prefix_end, :],
                 attention_mask=attention_mask[:, :prefix_end],
                 position_ids=position_ids[:, :prefix_end],
@@ -144,22 +160,39 @@ class Coconut(nn.Module):
         # One full pass produces the supervised logits after all latent inputs
         # have been filled. Labels for the question and latent positions are
         # masked, so no loss-bearing logits are discarded.
-        logits, _ = self._forward_chunk(
+        logits, final_hidden_states, past_key_values = self._forward_chunk(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            compute_logits=output_full_logits,
+            use_cache=use_cache,
         )
 
         self.gen_forward_cnt += max_n_latents + 1
 
-        shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss()
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
+        if output_full_logits:
+            shift_logits = logits[..., :-1, :].contiguous()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+        else:
+            supervised = shift_labels != -100
+            if not supervised.any():
+                raise ValueError("Coconut batch contains no supervised tokens")
+            supervised_hidden = final_hidden_states[..., :-1, :][supervised]
+            supervised_logits = self.base_causallm.get_output_embeddings()(
+                supervised_hidden
+            )
+            loss = loss_fct(supervised_logits, shift_labels[supervised])
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        return Outputs(
+            loss=loss,
+            inputs_embeds=inputs_embeds,
+            logits=logits,
+            past_key_values=past_key_values,
+        )
 
     def train(self, mode=True):
         super().train(mode)
@@ -175,6 +208,7 @@ class Coconut(nn.Module):
         max_new_tokens=16,
         output_embedding=False,
         synced_gpus=False,
+        use_generation_cache=False,
         **kwargs
     ):
 
@@ -192,6 +226,7 @@ class Coconut(nn.Module):
             torch.arange(
                 0, input_ids.shape[1], dtype=torch.long, device=input_ids.device
             ).reshape(1, -1),
+            use_cache=use_generation_cache,
         )
         inputs_embeds = outputs.inputs_embeds
 
@@ -204,8 +239,33 @@ class Coconut(nn.Module):
         new_inputs_embeds = torch.cat((inputs_embeds, new_token_embed), dim=1)
 
         # get other tokens
+        past_key_values = outputs.past_key_values
         for _ in range(max_new_tokens - 1):
-            outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
+            if use_generation_cache:
+                model_kwargs = {
+                    "inputs_embeds": new_token_embed,
+                    "attention_mask": torch.ones(
+                        (1, new_inputs_embeds.shape[1]),
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                    "position_ids": torch.tensor(
+                        [[new_inputs_embeds.shape[1] - 1]],
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                    "logits_to_keep": 1,
+                }
+                if self.is_ouro:
+                    model_kwargs["exit_at_step"] = (
+                        self.base_causallm.config.total_ut_steps - 1
+                    )
+                outputs = self.base_causallm(**model_kwargs)
+                past_key_values = outputs.past_key_values
+            else:
+                outputs = self.base_causallm(inputs_embeds=new_inputs_embeds)
             self.gen_forward_cnt += 1
             next_token = torch.argmax(outputs.logits[0, -1]).item()
             if next_token == self.eos_token_id:

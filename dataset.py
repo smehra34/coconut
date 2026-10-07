@@ -4,8 +4,10 @@
 import json
 import hashlib
 import itertools
+import fcntl
 import os
 import random
+import shutil
 import tempfile
 from dataclasses import dataclass
 from typing import Optional
@@ -18,6 +20,7 @@ from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 
 TOKENIZED_CACHE_VERSION = 1
+STAGE_CACHE_VERSION = 1
 
 
 def _tokenized_cache_path(path, tokenizer, max_size, cache_dir):
@@ -37,6 +40,51 @@ def _tokenized_cache_path(path, tokenizer, max_size, cache_dir):
         json.dumps(cache_identity, sort_keys=True).encode("utf-8")
     ).hexdigest()[:20]
     return os.path.join(cache_dir, digest)
+
+
+def _stage_cache_path(cache_dir, namespace, base_dataset, identity):
+    identity = {
+        "version": STAGE_CACHE_VERSION,
+        "namespace": namespace,
+        "base_fingerprint": base_dataset._fingerprint,
+        **identity,
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+    return os.path.join(cache_dir, f"{namespace}-{digest}")
+
+
+def _save_dataset_atomically(dataset, cache_path):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    lock_path = f"{cache_path}.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if os.path.isdir(cache_path):
+            return
+        temporary_path = tempfile.mkdtemp(
+            prefix="building-", dir=os.path.dirname(cache_path)
+        )
+        os.rmdir(temporary_path)
+        try:
+            dataset.save_to_disk(temporary_path)
+            os.replace(temporary_path, cache_path)
+        finally:
+            if os.path.isdir(temporary_path):
+                shutil.rmtree(temporary_path)
+
+
+def _load_or_build_dataset(cache_path, build_dataset):
+    distributed = dist.is_available() and dist.is_initialized()
+    if not cache_path:
+        return build_dataset()
+    if not os.path.isdir(cache_path) and (
+        not distributed or dist.get_rank() == 0
+    ):
+        _save_dataset_atomically(build_dataset(), cache_path)
+    if distributed:
+        dist.barrier()
+    return load_from_disk(cache_path)
 
 
 def get_dataset(path, tokenizer, max_size=1000000000, cache_dir=None):
@@ -239,6 +287,7 @@ def get_question_latent_dataset(
     latent_id,
     end_id,
     no_special_marker=False,
+    cache_dir=None,
 ):
 
     def process_dataset(sample):
@@ -268,8 +317,32 @@ def get_question_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
-    return base_dataset_valid.map(
-        process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
+    cache_path = (
+        _stage_cache_path(
+            cache_dir,
+            "question",
+            base_dataset_valid,
+            {
+                "scheduled_stage": scheduled_stage,
+                "max_latent_stage": configs.max_latent_stage,
+                "pad_latent_to_max": configs.pad_latent_to_max,
+                "c_thought": configs.c_thought,
+                "start_id": start_id,
+                "latent_id": latent_id,
+                "end_id": end_id,
+                "no_special_marker": no_special_marker,
+            },
+        )
+        if cache_dir
+        else None
+    )
+    return _load_or_build_dataset(
+        cache_path,
+        lambda: base_dataset_valid.map(
+            process_dataset,
+            remove_columns=list(base_dataset_valid.features),
+            num_proc=min(8, len(base_dataset_valid)),
+        ),
     )
 
 
@@ -282,6 +355,7 @@ def get_cot_latent_dataset(
     end_id,
     no_special_marker=False,
     shuffle=False,
+    cache_dir=None,
 ):
 
     n_additional_tokens = 0 if no_special_marker else 2
@@ -347,11 +421,44 @@ def get_cot_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
+    deterministic = configs.uniform_prob == 0
+    cache_path = (
+        _stage_cache_path(
+            cache_dir,
+            "cot-latent",
+            base_dataset,
+            {
+                "scheduled_stage": scheduled_stage,
+                "max_latent_stage": configs.max_latent_stage,
+                "pad_latent_to_max": configs.pad_latent_to_max,
+                "c_thought": configs.c_thought,
+                "no_cot": configs.no_cot,
+                "start_id": start_id,
+                "latent_id": latent_id,
+                "end_id": end_id,
+                "no_special_marker": no_special_marker,
+            },
+        )
+        if cache_dir and deterministic
+        else None
+    )
+
+    def build_dataset():
+        return base_dataset.map(
+            process_dataset,
+            remove_columns=list(base_dataset.features),
+            num_proc=min(8, len(base_dataset)),
+        )
+
+    if cache_path:
+        dataset = _load_or_build_dataset(cache_path, build_dataset)
+        if shuffle:
+            dataset = dataset.shuffle()
+        return dataset
+
     if torch.cuda.device_count() > 1:
         if dist.get_rank() == 0:
-            processed_dataset = base_dataset.map(
-                process_dataset, remove_columns=list(base_dataset.features), num_proc=32
-            )
+            processed_dataset = build_dataset()
             if shuffle:
                 processed_dataset = processed_dataset.shuffle()
             processed_dataset = [processed_dataset]
