@@ -273,7 +273,13 @@ def get_wandb_run_id(save_dir):
         with open(run_id_path) as run_id_file:
             return run_id_file.read().strip()
 
-    run_id = wandb.util.generate_id()
+    try:
+        generate_id = wandb.util.generate_id
+    except AttributeError:
+        # W&B 0.29 moved this helper out of the public ``wandb.util`` module.
+        from wandb.sdk.lib.runid import generate_id
+
+    run_id = generate_id()
     temporary_path = f"{run_id_path}.tmp"
     with open(temporary_path, "w") as run_id_file:
         run_id_file.write(run_id)
