@@ -1,0 +1,38 @@
+# Initialize from checkpoint_3 produced by gsm_ouro_1.4b_r1_stage0_cot.yaml.
+project: coconut-looped
+save_path: checkpoints
+name: gsm-ouro-1.4b-r1-coconut-seed0
+
+only_eval: false
+coconut: true
+cot: false
+no_thoughts: false
+no_cot: false
+
+c_thought: 1
+epochs_per_stage: 1
+stage_epochs: [3, 1, 1, 1, 1]
+max_latent_stage: 3
+pad_latent_to_max: true
+
+save_only_improve: false
+uniform_prob: 0.0
+model_id: ByteDance/Ouro-1.4B
+model_revision: 574fa66cb8bf5abdc979642d01cf2b79b16bfab1
+trust_remote_code: true
+attn_implementation: sdpa
+ouro_recurrent_steps: 1
+load_model_path: checkpoints/gsm-ouro-1.4b-r1-stage0-cot-seed0/checkpoint_3
+seed: 0
+resume: 3
+bf16: true
+gradient_checkpointing: false
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+reset_optimizer: true
+batch_size_training: 32
+debug: false
+gradient_accumulation_steps: 1
+num_epochs: 7
+lr: !!float "2e-5"
+weight_decay: 0.01

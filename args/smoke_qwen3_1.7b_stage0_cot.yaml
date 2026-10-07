@@ -1,0 +1,38 @@
+project: coconut-looped-smoke
+save_path: checkpoints/smoke
+name: qwen3-1.7b-stage0-cot
+
+only_eval: false
+coconut: false
+cot: true
+no_thoughts: false
+no_cot: false
+
+c_thought: 0
+epochs_per_stage: 1
+stage_epochs: [1]
+max_latent_stage: 0
+pad_latent_to_max: true
+
+save_only_improve: false
+uniform_prob: 0.0
+model_id: Qwen/Qwen3-1.7B-Base
+model_revision: ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+trust_remote_code: false
+attn_implementation: sdpa
+load_model_path: null
+seed: 0
+resume: 0
+bf16: true
+gradient_checkpointing: true
+train_path: data/gsm_train.json
+val_path: data/gsm_valid.json
+reset_optimizer: false
+batch_size_training: 1
+debug: true
+max_train_samples: 8
+max_val_samples: 4
+gradient_accumulation_steps: 2
+num_epochs: 1
+lr: !!float "2e-5"
+weight_decay: 0.01
