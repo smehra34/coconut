@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from collections import namedtuple
-from transformers.models.gpt2 import GPT2LMHeadModel
 
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 MAX_N_LATENT = 8
@@ -30,15 +29,71 @@ class Coconut(nn.Module):
         self.start_latent_id = start_latent_id
         self.end_latent_id = end_latent_id
 
-        # tested with GPT2 and Llama3
-        if isinstance(self.base_causallm, GPT2LMHeadModel):
-            self.embedding = self.base_causallm.transformer.get_input_embeddings()
-        else:
-            self.embedding = self.base_causallm.get_input_embeddings()
+        self.embedding = self.base_causallm.get_input_embeddings()
+
+    @property
+    def is_ouro(self):
+        return getattr(self.base_causallm.config, "model_type", None) == "ouro"
+
+    def _forward_chunk(
+        self, inputs_embeds, attention_mask, position_ids, compute_logits=True
+    ):
+        """Return final-step logits and hidden states without using a KV cache.
+
+        Decoder-style Hugging Face models expose a base model's final hidden
+        state directly. Ouro instead returns its recurrent-step hidden states
+        as an additional tuple, so it needs a small adapter. Keeping this path
+        cache-free is slower, but it is robust across cache implementations and
+        retains the full autograd graph required by Coconut training.
+        """
+        if self.is_ouro:
+            _, recurrent_hidden_states, _ = self.base_causallm.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+            if not recurrent_hidden_states:
+                raise RuntimeError("Ouro did not return recurrent hidden states")
+            hidden_states = recurrent_hidden_states[-1]
+            logits = (
+                self.base_causallm.get_output_embeddings()(hidden_states)
+                if compute_logits
+                else None
+            )
+            return logits, hidden_states
+
+        decoder = getattr(self.base_causallm, "model", None)
+        if decoder is not None:
+            outputs = decoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+            logits = (
+                self.base_causallm.get_output_embeddings()(hidden_states)
+                if compute_logits
+                else None
+            )
+            return logits, hidden_states
+
+        outputs = self.base_causallm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        if outputs.hidden_states is None:
+            raise RuntimeError(
+                f"{type(self.base_causallm).__name__} did not return hidden states"
+            )
+        return outputs.logits, outputs.hidden_states[-1]
 
     def forward(self, input_ids, attention_mask, labels, position_ids, **kwargs):
-
-        logits = []
 
         latent_indices = (
             input_ids == self.latent_token_id
@@ -51,75 +106,21 @@ class Coconut(nn.Module):
 
         max_n_latents = max([len(l) for l in latent_lists])
 
-        next_compute_range = (0, input_ids.shape[1])
         inputs_embeds = self.embedding(input_ids)
 
-        if max_n_latents > 0:
-            next_compute_range = (0, latent_indices[:, 1].min().item())
-            # before the earliest latent token position
-
-        kv_cache = None
-
         for pass_idx in range(max_n_latents):
-
-            if kv_cache == None:
-                # first forward pass
-                outputs = self.base_causallm(
-                    inputs_embeds=inputs_embeds[
-                        :, next_compute_range[0] : next_compute_range[1], :
-                    ],
-                    attention_mask=attention_mask[
-                        :, next_compute_range[0] : next_compute_range[1]
-                    ],
-                    position_ids=position_ids[
-                        :, next_compute_range[0] : next_compute_range[1]
-                    ],
-                    output_hidden_states=True,
-                )
-                hidden_states_offset = 0
-
-            else:
-                # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-
-                outputs = self.base_causallm(
-                    inputs_embeds=inputs_embeds[
-                        :, next_compute_range[0] : next_compute_range[1], :
-                    ],
-                    attention_mask=attention_mask[:, : next_compute_range[1]],
-                    position_ids=position_ids[
-                        :, next_compute_range[0] : next_compute_range[1]
-                    ],
-                    past_key_values=past_key_values,
-                    output_hidden_states=True,
-                )
-
-                hidden_states_offset = next_compute_range[0]
-                # when we use kv_cache for the first k tokens
-                # in `outputs.hidden_states`, [0, k) will be skipped
-                # so we need to keep this offset to correctly use the last hidden states
-
-            logits.append(outputs.logits)
-
-            next_compute_range = (
-                next_compute_range[1],
-                (
-                    input_ids.shape[1]
-                    if pass_idx + 1 >= max_n_latents
-                    else next_compute_range[1] + 1
-                ),
+            active_latent_positions = [
+                latent_list[pass_idx]
+                for latent_list in latent_lists
+                if len(latent_list) > pass_idx
+            ]
+            prefix_end = max(active_latent_positions)
+            _, hidden_states = self._forward_chunk(
+                inputs_embeds=inputs_embeds[:, :prefix_end, :],
+                attention_mask=attention_mask[:, :prefix_end],
+                position_ids=position_ids[:, :prefix_end],
+                compute_logits=False,
             )
-
-            hidden_states = outputs.hidden_states[
-                -1
-            ]  # Get the last layer hidden states
-            kv_cache = outputs.past_key_values
 
             # feedback the continuous thoughts to the input_embeds
 
@@ -130,59 +131,27 @@ class Coconut(nn.Module):
                 if len(mask_list) > pass_idx
             ]
 
-            # to avoid in-place operations
-            # break down inputs_embeds (bs, len, hidden_size) into a list of list of 1-d tensors
-            tensor_list = [
-                [
-                    inputs_embeds[batch_idx, pos, :]
-                    for pos in range(inputs_embeds.shape[1])
-                ]
-                for batch_idx in range(inputs_embeds.shape[0])
-            ]
+            batch_indices, token_indices = zip(*filling_indices)
+            batch_indices = torch.tensor(batch_indices, device=inputs_embeds.device)
+            token_indices = torch.tensor(token_indices, device=inputs_embeds.device)
+            replacements = hidden_states[batch_indices, token_indices - 1]
 
-            # replace some of them with continuous thoughts
-            for idx_pair in filling_indices:
-                batch_idx, token_idx = idx_pair
+            # Clone before indexed assignment so autograd preserves both the
+            # untouched token embeddings and the continuous-thought graph.
+            inputs_embeds = inputs_embeds.clone()
+            inputs_embeds[batch_indices, token_indices] = replacements
 
-                # replace it with the preceding last hidden states
-                tensor_list[batch_idx][token_idx] = hidden_states[
-                    batch_idx, token_idx - 1 - hidden_states_offset, :
-                ]
-
-            # assemble the new inputs_embeds
-            inputs_embeds = torch.stack(
-                [
-                    torch.stack(tensor_list[batch_idx])
-                    for batch_idx in range(inputs_embeds.shape[0])
-                ]
-            )
-
-        # final pass
-        outputs = self.base_causallm(
-            inputs_embeds=inputs_embeds[
-                :, next_compute_range[0] : next_compute_range[1], :
-            ],
-            attention_mask=attention_mask[:, : next_compute_range[1]],
-            position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
-            output_hidden_states=True,
+        # One full pass produces the supervised logits after all latent inputs
+        # have been filled. Labels for the question and latent positions are
+        # masked, so no loss-bearing logits are discarded.
+        logits, _ = self._forward_chunk(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
-
-        logits.append(outputs.logits)
 
         self.gen_forward_cnt += max_n_latents + 1
 
-        logits = torch.cat(logits, dim=-2)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss()
@@ -192,11 +161,12 @@ class Coconut(nn.Module):
 
         return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
 
-    def train(self):
-        self.base_causallm.train()
+    def train(self, mode=True):
+        super().train(mode)
+        return self
 
     def eval(self):
-        self.base_causallm.eval()
+        return self.train(False)
 
     def generate(
         self,
