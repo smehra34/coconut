@@ -2,40 +2,76 @@
 # All rights reserved.
 
 import json
+import hashlib
 import itertools
+import os
 import random
+import tempfile
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
 
-def get_dataset(path, tokenizer, max_size=1000000000):
+TOKENIZED_CACHE_VERSION = 1
 
-    def tokenize_sample(sample):
 
-        question_tokenized = tokenizer.encode(
-            sample["question"] + "\n", add_special_tokens=True
+def _tokenized_cache_path(path, tokenizer, max_size, cache_dir):
+    with open(path, "rb") as data_file:
+        data_digest = hashlib.sha256(data_file.read()).hexdigest()
+    cache_identity = {
+        "version": TOKENIZED_CACHE_VERSION,
+        "data": data_digest,
+        "max_size": max_size,
+        "tokenizer_class": type(tokenizer).__name__,
+        "tokenizer_name": tokenizer.name_or_path,
+        "tokenizer_commit": tokenizer.init_kwargs.get("_commit_hash"),
+        "vocab_size": len(tokenizer),
+        "special_tokens": tokenizer.special_tokens_map,
+    }
+    digest = hashlib.sha256(
+        json.dumps(cache_identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+    return os.path.join(cache_dir, digest)
+
+
+def get_dataset(path, tokenizer, max_size=1000000000, cache_dir=None):
+
+    def tokenize_batch(batch):
+        questions = tokenizer(
+            [question + "\n" for question in batch["question"]],
+            add_special_tokens=True,
+        )["input_ids"]
+        answers = tokenizer(
+            ["### " + answer for answer in batch["answer"]],
+            add_special_tokens=False,
+        )["input_ids"]
+
+        step_counts = [len(steps) for steps in batch["steps"]]
+        flat_steps = [step + "\n" for steps in batch["steps"] for step in steps]
+        flat_step_tokens = (
+            tokenizer(flat_steps, add_special_tokens=False)["input_ids"]
+            if flat_steps
+            else []
         )
-        steps_tokenized = [
-            tokenizer.encode(s + "\n", add_special_tokens=False)
-            for s in sample["steps"]
-        ]
-        answer_tokenized = tokenizer.encode(
-            "### " + sample["answer"], add_special_tokens=False
-        ) + [tokenizer.eos_token_id]
+        steps_tokenized = []
+        offset = 0
+        for count in step_counts:
+            steps_tokenized.append(flat_step_tokens[offset : offset + count])
+            offset += count
 
-        sample = {
-            "question_tokenized": question_tokenized,
+        return {
+            "question_tokenized": questions,
             "steps_tokenized": steps_tokenized,
-            "answer_tokenized": answer_tokenized,
-            "idx": sample["idx"],
+            "answer_tokenized": [
+                answer + [tokenizer.eos_token_id] for answer in answers
+            ],
+            "idx": batch["idx"],
         }
-        return sample
 
     data = json.load(open(path))[:max_size]
     data = [{**d, "idx": idx} for idx, d in enumerate(data)]
@@ -43,22 +79,32 @@ def get_dataset(path, tokenizer, max_size=1000000000):
     keys = data[0].keys()
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
 
-    if torch.cuda.device_count() > 1:
-        if dist.get_rank() == 0:
-            processed_dataset = [
-                dataset.map(
-                    tokenize_sample, remove_columns=list(dataset.features), num_proc=32
-                )
-            ]
-        else:
-            processed_dataset = [None]
-        dist.broadcast_object_list(processed_dataset, src=0)
-        dataset = processed_dataset[0]
-
-    else:
+    distributed = dist.is_available() and dist.is_initialized()
+    cache_path = (
+        _tokenized_cache_path(path, tokenizer, max_size, cache_dir)
+        if cache_dir
+        else None
+    )
+    build_cache = not cache_path or not os.path.isdir(cache_path)
+    if build_cache and (not distributed or dist.get_rank() == 0):
         dataset = dataset.map(
-            tokenize_sample, remove_columns=list(dataset.features), num_proc=32
+            tokenize_batch,
+            batched=True,
+            batch_size=512,
+            remove_columns=list(dataset.features),
+            num_proc=min(8, len(dataset)),
         )
+        if cache_path:
+            os.makedirs(cache_dir, exist_ok=True)
+            temporary_path = tempfile.mkdtemp(prefix="building-", dir=cache_dir)
+            os.rmdir(temporary_path)
+            dataset.save_to_disk(temporary_path)
+            os.replace(temporary_path, cache_path)
+
+    if distributed:
+        dist.barrier()
+    if cache_path:
+        dataset = load_from_disk(cache_path)
 
     # verify
     d = data[0]
