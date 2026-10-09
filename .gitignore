@@ -1,7 +1,8 @@
 __pycache__/
 *.py[cod]
-checkpoints/
+checkpoints
 data/gsm_*.json
-data/tokenized_cache/
+data/tokenized_cache
 data/tokenized_cache_test/
-logs/
+logs
+wandb
