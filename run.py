@@ -41,6 +41,7 @@ import importlib
 import random
 import re
 import time
+from contextlib import nullcontext
 import numpy as np
 from utils import Config, set_seed
 
@@ -76,6 +77,17 @@ def get_scheduled_stage(epoch, configs):
     return epoch // configs.epochs_per_stage
 
 
+def get_expected_visible_cot(steps, scheduled_stage, configs):
+    """Return the textual CoT suffix supervised at a curriculum stage."""
+    if configs.cot:
+        return "\n".join(steps)
+    if configs.no_cot:
+        return ""
+    if scheduled_stage > configs.max_latent_stage:
+        return ""
+    return "\n".join(steps[scheduled_stage:])
+
+
 def get_decoder_layer_classes(model):
     base_model = model.base_causallm if isinstance(model, Coconut) else model
     decoder = getattr(base_model, "model", None)
@@ -95,6 +107,55 @@ def causal_lm_loss(logits, labels):
     return CrossEntropyLoss()(
         shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
     )
+
+
+def measure_and_clip_grad_norm(parallel_model, distributed_strategy, max_grad_norm):
+    """Return the global L2 gradient norm and optionally clip it.
+
+    ``None`` and non-positive values preserve the original Coconut behavior:
+    gradients are measured but not clipped. FSDP must calculate the norm via
+    its wrapper because individual ranks only own parameter shards.
+    """
+    clipping_enabled = max_grad_norm is not None and float(max_grad_norm) > 0
+    norm_limit = float(max_grad_norm) if clipping_enabled else float("inf")
+    if distributed_strategy == "fsdp":
+        grad_norm = parallel_model.clip_grad_norm_(norm_limit)
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            parallel_model.parameters(), norm_limit
+        )
+    return grad_norm, clipping_enabled
+
+
+def find_nonfinite_gradients(model, limit=50):
+    """Describe locally owned parameter gradients containing NaN or Inf."""
+    findings = []
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if gradient is None or gradient.numel() == 0:
+            continue
+        finite = torch.isfinite(gradient)
+        if finite.all():
+            continue
+        finite_values = gradient[finite]
+        findings.append(
+            {
+                "name": name,
+                "shape": tuple(gradient.shape),
+                "dtype": str(gradient.dtype),
+                "nan": int(torch.isnan(gradient).sum().item()),
+                "posinf": int(torch.isposinf(gradient).sum().item()),
+                "neginf": int(torch.isneginf(gradient).sum().item()),
+                "finite_abs_max": (
+                    float(finite_values.abs().max().float().item())
+                    if finite_values.numel()
+                    else None
+                ),
+            }
+        )
+        if len(findings) >= limit:
+            break
+    return findings
 
 
 def forward_for_loss(parallel_model, batch, is_ouro, ouro_recurrent_steps):
@@ -313,6 +374,16 @@ def main():
 
     configs = Config(config_dict)
     set_seed(configs.seed)
+    if config_value(configs, "disable_cudnn_sdp", False):
+        torch.backends.cuda.enable_cudnn_sdp(False)
+    if rank == 0:
+        print(
+            "SDPA backends: "
+            f"cudnn={torch.backends.cuda.cudnn_sdp_enabled()}, "
+            f"flash={torch.backends.cuda.flash_sdp_enabled()}, "
+            f"memory_efficient={torch.backends.cuda.mem_efficient_sdp_enabled()}, "
+            f"math={torch.backends.cuda.math_sdp_enabled()}"
+        )
     save_dir = os.path.join(configs.save_path, configs.name)
 
     if not os.path.exists(save_dir) and rank == 0:
@@ -527,11 +598,13 @@ def main():
         print(parallel_model)
 
     # prepare the ground truth answer and cot for evaluation
-    question_val = [d["question"] for d in json.load(open(configs.val_path))]
+    validation_records = json.load(open(configs.val_path))
+    question_val = [d["question"] for d in validation_records]
     answers_val = [
-        d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
+        d["answer"].replace(",", "").strip() for d in validation_records
     ]
-    cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+    cot_steps_val = [d["steps"] for d in validation_records]
+    cot_val = ["\n".join(steps) for steps in cot_steps_val]
 
     max_val_samples = config_value(
         configs, "max_val_samples", 32 if configs.debug else 100000000
@@ -622,7 +695,33 @@ def main():
         del resume_state
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
-
+    max_grad_norm = config_value(configs, "max_grad_norm")
+    if max_grad_norm is not None:
+        max_grad_norm = float(max_grad_norm)
+    if rank == 0:
+        clipping_description = (
+            f"enabled at {max_grad_norm}"
+            if max_grad_norm is not None and max_grad_norm > 0
+            else "disabled (gradient norms will still be logged)"
+        )
+        print(f"Gradient clipping: {clipping_description}")
+    diagnose_nonfinite = bool(
+        config_value(configs, "diagnose_nonfinite_gradients", False)
+    )
+    anomaly_steps = {
+        int(step) for step in config_value(configs, "anomaly_detection_steps", [])
+    }
+    diagnostic_stop_after_step = config_value(
+        configs, "diagnostic_stop_after_step"
+    )
+    if diagnostic_stop_after_step is not None:
+        diagnostic_stop_after_step = int(diagnostic_stop_after_step)
+    if rank == 0 and (diagnose_nonfinite or anomaly_steps):
+        print(
+            "Gradient diagnostics: "
+            f"pre-clip scan={diagnose_nonfinite}, "
+            f"anomaly steps={sorted(anomaly_steps)}"
+        )
     for epoch in range(configs.resume, configs.num_epochs):
 
         scheduled_stage = get_scheduled_stage(epoch, configs)
@@ -709,6 +808,12 @@ def main():
             torch.cuda.reset_peak_memory_stats(local_rank)
             train_start_time = time.monotonic()
             local_examples_seen = 0
+            local_train_loss_sum = torch.zeros(
+                (), dtype=torch.float64, device=local_rank
+            )
+            local_train_batches = torch.zeros(
+                (), dtype=torch.int64, device=local_rank
+            )
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
             pbar = tqdm(
@@ -718,9 +823,11 @@ def main():
                 dynamic_ncols=True,
             )
 
+            diagnostic_stopped = False
             for step, batch in enumerate(train_dataloader):
 
                 local_examples_seen += batch["input_ids"].shape[0]
+                batch_indices = batch["idx"].tolist()
 
                 if step == 0 and wandb_run and rank == 0:
                     print("logging training data")
@@ -752,25 +859,97 @@ def main():
                     if key != "idx"
                 }
 
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.bfloat16,
-                    enabled=configs.bf16 and distributed_strategy == "ddp",
-                ):
-                    if configs.coconut:
-                        batch_loss = parallel_model(**batch).loss
-                    else:
-                        batch_loss = forward_for_loss(
-                            parallel_model, batch, is_ouro, ouro_recurrent_steps
-                        )
-                loss = batch_loss / configs.gradient_accumulation_steps
-                loss.backward()
+                anomaly_context = (
+                    torch.autograd.detect_anomaly(check_nan=True)
+                    if step in anomaly_steps
+                    else nullcontext()
+                )
+                with anomaly_context:
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=torch.bfloat16,
+                        enabled=configs.bf16 and distributed_strategy == "ddp",
+                    ):
+                        if configs.coconut:
+                            batch_loss = parallel_model(**batch).loss
+                        else:
+                            batch_loss = forward_for_loss(
+                                parallel_model, batch, is_ouro, ouro_recurrent_steps
+                            )
+                    loss = batch_loss / configs.gradient_accumulation_steps
+                    loss.backward()
+                local_train_loss_sum += batch_loss.detach().double()
+                local_train_batches += 1
 
-                if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
-                    train_dataloader
-                ) - 1:
+                optimizer_step = (
+                    (step + 1) % configs.gradient_accumulation_steps == 0
+                    or step == len(train_dataloader) - 1
+                )
+                grad_log_dict = {}
+                if optimizer_step:
+                    if diagnose_nonfinite:
+                        local_findings = find_nonfinite_gradients(parallel_model)
+                        local_has_nonfinite = torch.tensor(
+                            bool(local_findings), dtype=torch.int32, device=local_rank
+                        )
+                        dist.all_reduce(local_has_nonfinite, op=dist.ReduceOp.MAX)
+                        if local_has_nonfinite.item():
+                            print(
+                                "NONFINITE_GRADIENT_DIAGNOSTIC "
+                                + json.dumps(
+                                    {
+                                        "epoch": epoch + 1,
+                                        "batch": step,
+                                        "rank": rank,
+                                        "sample_indices": batch_indices,
+                                        "findings": local_findings,
+                                    },
+                                    sort_keys=True,
+                                ),
+                                flush=True,
+                            )
+                            optimizer.zero_grad(set_to_none=True)
+                            raise FloatingPointError(
+                                "Non-finite parameter gradient detected before "
+                                f"clipping: epoch={epoch + 1}, batch={step}, "
+                                f"rank={rank}"
+                            )
+                    grad_norm, clipping_enabled = measure_and_clip_grad_norm(
+                        parallel_model, distributed_strategy, max_grad_norm
+                    )
+                    grad_norm_value = float(grad_norm.detach().float())
+                    if not np.isfinite(grad_norm_value):
+                        optimizer.zero_grad(set_to_none=True)
+                        if wandb_run and rank == 0:
+                            wandb_run.log(
+                                {
+                                    "train/grad_norm": grad_norm_value,
+                                    "train/nonfinite_gradient": 1.0,
+                                    "train/epoch": epoch + 1,
+                                    "train/step": epoch * len(train_dataloader)
+                                    + step,
+                                }
+                            )
+                        raise FloatingPointError(
+                            "Non-finite gradient norm before optimizer step: "
+                            f"epoch={epoch + 1}, batch={step}, rank={rank}, "
+                            f"sample_indices={batch_indices}, "
+                            f"grad_norm={grad_norm_value}"
+                        )
+
+                    clip_coefficient = 1.0
+                    if clipping_enabled:
+                        clip_coefficient = min(
+                            1.0, max_grad_norm / (grad_norm_value + 1e-6)
+                        )
+                    grad_log_dict = {
+                        "train/grad_norm": grad_norm_value,
+                        "train/grad_clip_coefficient": clip_coefficient,
+                        "train/grad_clipped": float(clip_coefficient < 1.0),
+                        "train/nonfinite_gradient": 0.0,
+                    }
                     optimizer.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     pbar.update(1)
 
                 if wandb_run and rank == 0:
@@ -779,14 +958,48 @@ def main():
                         "train/step": epoch * len(train_dataloader) + step,
                         "train/loss": loss.detach().float()
                         * configs.gradient_accumulation_steps,
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/sequence_length": batch["input_ids"].shape[1],
+                        "train/non_padding_tokens": batch["attention_mask"].sum(),
+                        "train/supervised_tokens": (batch["labels"] != -100).sum(),
+                        "train/gpu_memory_allocated_gib": torch.cuda.memory_allocated(
+                            local_rank
+                        )
+                        / 2**30,
+                        "train/gpu_memory_reserved_gib": torch.cuda.memory_reserved(
+                            local_rank
+                        )
+                        / 2**30,
+                        **grad_log_dict,
                     }
+                    if configs.coconut:
+                        log_dict["train/latent_tokens"] = (
+                            batch["input_ids"] == latent_id
+                        ).sum()
                     wandb_run.log(log_dict)
 
                 pbar.set_description(
                     f"Training Epoch: {epoch+1}/{configs.num_epochs}, batch {step}/{len(train_dataloader)} "
                     f"completed (loss: {round(float(loss.detach().float() * configs.gradient_accumulation_steps), 4)}"
                 )
+                if (
+                    diagnostic_stop_after_step is not None
+                    and step >= diagnostic_stop_after_step
+                ):
+                    diagnostic_stopped = True
+                    break
             pbar.close()
+            if diagnostic_stopped:
+                if rank == 0:
+                    print(
+                        "Diagnostic run completed after training batch "
+                        f"{diagnostic_stop_after_step}."
+                    )
+                    if wandb_run:
+                        wandb_run.finish()
+                dist.barrier()
+                dist.destroy_process_group()
+                return
             torch.cuda.synchronize(local_rank)
             train_elapsed = torch.tensor(
                 time.monotonic() - train_start_time,
@@ -798,6 +1011,8 @@ def main():
             )
             dist.all_reduce(train_elapsed, op=dist.ReduceOp.MAX)
             dist.all_reduce(examples_seen, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_train_loss_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(local_train_batches, op=dist.ReduceOp.SUM)
             peak_memory = torch.tensor(
                 torch.cuda.max_memory_allocated(local_rank),
                 dtype=torch.int64,
@@ -805,12 +1020,27 @@ def main():
             )
             dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
             if rank == 0:
+                epoch_train_loss = (
+                    local_train_loss_sum / local_train_batches
+                ).item()
+                throughput = examples_seen.item() / train_elapsed.item()
                 print(
                     "Training throughput: "
-                    f"{examples_seen.item() / train_elapsed.item():.2f} examples/s "
+                    f"{throughput:.2f} examples/s "
                     f"({examples_seen.item()} examples in {train_elapsed.item():.2f}s); "
                     f"peak allocated memory: {peak_memory.item() / 2**30:.2f} GiB/GPU"
                 )
+                if wandb_run:
+                    wandb_run.log(
+                        {
+                            "train/epoch_loss": epoch_train_loss,
+                            "train/throughput_examples_per_second": throughput,
+                            "train/epoch_seconds": train_elapsed.item(),
+                            "train/epoch_examples": examples_seen.item(),
+                            "train/peak_memory_allocated_gib": peak_memory.item()
+                            / 2**30,
+                        }
+                    )
             dist.barrier()
 
             if not configs.save_only_improve and not configs.debug:
@@ -833,7 +1063,12 @@ def main():
                 continue
 
             # val loss
-            total_loss = 0
+            validation_loss_sum = torch.zeros(
+                (), dtype=torch.float64, device=local_rank
+            )
+            validation_token_count = torch.zeros(
+                (), dtype=torch.int64, device=local_rank
+            )
 
             with torch.no_grad():
                 parallel_model.module.eval()
@@ -856,16 +1091,24 @@ def main():
                             loss = forward_for_loss(
                                 parallel_model, batch, is_ouro, ouro_recurrent_steps
                             )
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    total_loss += loss.item() / world_size
+                    supervised_tokens = (batch["labels"][..., 1:] != -100).sum()
+                    validation_loss_sum += loss.detach().double() * supervised_tokens
+                    validation_token_count += supervised_tokens
+
+                dist.all_reduce(validation_loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(validation_token_count, op=dist.ReduceOp.SUM)
+                eval_loss = (validation_loss_sum / validation_token_count).item()
 
                 if wandb_run and rank == 0:
 
                     log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
+                        "eval/loss": eval_loss,
+                        "eval/perplexity": float(np.exp(eval_loss)),
+                        "eval/loss_supervised_tokens": validation_token_count.item(),
+                        "eval/curriculum_stage": scheduled_stage,
                     }
                     wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                    print("eval loss", eval_loss)
 
         # val generation accuracy
         total_length = len(valid_gen_dataloader)
@@ -873,7 +1116,8 @@ def main():
         pbar = tqdm(
             colour="blue", desc=f"Test Accuracy", total=total_length, dynamic_ncols=True
         )
-        cor, cor_cot, total = (
+        cor, cor_cot, cor_full_cot, total = (
+            torch.tensor(0, device=local_rank),
             torch.tensor(0, device=local_rank),
             torch.tensor(0, device=local_rank),
             torch.tensor(0, device=local_rank),
@@ -893,7 +1137,10 @@ def main():
 
                 assert len(batch["input_ids"]) == 1
                 answer = answers_val[test_idx.cpu().item()]
-                answer_cot = cot_val[test_idx.cpu().item()]
+                full_answer_cot = cot_val[test_idx.cpu().item()]
+                answer_cot = get_expected_visible_cot(
+                    cot_steps_val[test_idx.cpu().item()], scheduled_stage, configs
+                )
                 question = question_val[test_idx.cpu().item()]
 
                 total += 1
@@ -932,6 +1179,7 @@ def main():
 
                 cor += answer_output == answer
                 cor_cot += cot_output == answer_cot
+                cor_full_cot += cot_output == full_answer_cot
 
                 pbar.update(1)
                 pbar.set_description(
@@ -939,22 +1187,45 @@ def main():
                 )
 
             pbar.close()
-            print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
+            print(
+                f"Device {rank}: Cor={cor}, VisibleCoT={cor_cot}, "
+                f"FullCoT={cor_full_cot}, Total={total}"
+            )
 
         dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cor_full_cot, op=dist.ReduceOp.SUM)
         dist.all_reduce(cor, op=dist.ReduceOp.SUM)
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
 
         cor_cot = cor_cot.item()
+        cor_full_cot = cor_full_cot.item()
         cor = cor.item()
         total = total.item()
         if rank == 0:
             print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
-            print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
+            print(
+                "Visible CoT match on validation set: "
+                f"{cor_cot} / {total} = {cor_cot/total}"
+            )
+            print(
+                "Full CoT match on validation set: "
+                f"{cor_full_cot} / {total} = {cor_full_cot/total}"
+            )
         sys.stdout.flush()
 
         if wandb_run:
-            wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+            wandb_run.log(
+                {
+                    "eval/acc": cor / total,
+                    "eval/correct": cor,
+                    "eval/total": total,
+                    "eval/cot_em": cor_cot / total,
+                    "eval/cot_correct": cor_cot,
+                    "eval/full_cot_em": cor_full_cot / total,
+                    "eval/full_cot_correct": cor_full_cot,
+                    "eval/curriculum_stage": scheduled_stage,
+                }
+            )
 
         if configs.only_eval:
             break

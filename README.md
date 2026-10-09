@@ -20,6 +20,14 @@ pip install -r requirements.txt
 
 The code relies on [wandb](https://wandb.ai/site/) for logging. Please log in your wandb account following this [document](https://docs.wandb.ai/ref/cli/wandb-login/) before running any experiments.
 
+Training logs include per-batch loss, pre-clipping gradient norm, clipping
+coefficient, learning rate, sequence/token counts, and GPU memory, plus
+epoch-level mean loss, throughput, duration, and peak allocated memory.
+Validation logs include teacher-forced loss, generated-answer exact-match
+accuracy, and exact match of the generated visible CoT suffix. The latter is
+curriculum-aware; `eval/full_cot_em` retains comparison against the complete
+original reasoning chain for reference.
+
 ## Data
 
 The data for training and evaluation should be presented as a json file like below:
@@ -78,6 +86,14 @@ The configuration of a run should be specified in a yaml file (an example can be
   - **resume**: The epoch to resume. Can be used when we want to skip the initial training stages.
   - **bf16**: Whether to use bf16 training.
   - **gradient_checkpointing**: Whether to checkpoint decoder activations during training.
+  - **max_grad_norm**: Optional global L2 gradient-clipping threshold. Missing,
+    `null`, or a non-positive value preserves the original unclipped Coconut
+    behavior. Gradient norms are logged even when clipping is disabled.
+  - **disable_cudnn_sdp**: Disable only the cuDNN implementation of PyTorch
+    scaled-dot-product attention. The Qwen and Ouro Coconut recipes enable this
+    because the Alps nv25.12/CUDA 13.2 stack reproducibly returned NaNs from
+    `ScaledDotProductCudnnAttentionBackward0`; Flash, memory-efficient, and math
+    SDPA backends remain available.
   - **distributed_strategy**: Optional training wrapper, `fsdp` (default) or `ddp`. Evaluation continues to use DDP.
   - **tokenized_cache_dir**: Optional persistent Arrow cache for base tokenization. Defaults to `data/tokenized_cache`.
   - **train_path**: Path to the training set.
