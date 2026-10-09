@@ -1,7 +1,7 @@
 # Initialize from checkpoint_3 produced by gsm_ouro_1.4b_r1_stage0_cot.yaml.
 project: coconut-looped
 save_path: checkpoints
-name: gsm-ouro-1.4b-r1-coconut-seed0
+name: gsm-ouro-1.4b-r1-coconut-gc-clip1-seed0
 
 only_eval: false
 coconut: true
@@ -26,13 +26,17 @@ load_model_path: checkpoints/gsm-ouro-1.4b-r1-stage0-cot-seed0/checkpoint_3
 seed: 0
 resume: 3
 bf16: true
-gradient_checkpointing: false
+gradient_checkpointing: true
+# Work around NaN gradients in ScaledDotProductCudnnAttentionBackward0 on the
+# Alps nv25.12/CUDA 13.2 stack; PyTorch SDPA remains enabled via other backends.
+disable_cudnn_sdp: true
 train_path: data/gsm_train.json
 val_path: data/gsm_valid.json
 reset_optimizer: true
 batch_size_training: 32
 debug: false
 gradient_accumulation_steps: 1
+max_grad_norm: 1.0
 num_epochs: 7
 lr: !!float "2e-5"
 weight_decay: 0.01
