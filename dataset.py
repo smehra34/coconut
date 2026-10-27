@@ -268,6 +268,19 @@ def get_question_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = base_dataset_valid.map(
+                process_dataset,
+                remove_columns=list(base_dataset_valid.features),
+                num_proc=32,
+            )
+            processed_dataset = [processed_dataset]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        return processed_dataset[0]
+
     return base_dataset_valid.map(
         process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
     )
