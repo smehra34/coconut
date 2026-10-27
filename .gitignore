@@ -6,3 +6,4 @@ data/tokenized_cache
 data/tokenized_cache_test/
 logs
 wandb
+core_nid*
